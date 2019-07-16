@@ -1,5 +1,7 @@
 -module(rabbit_env).
 
+-include_lib("kernel/include/file.hrl").
+
 -export([get_context_before_logging_init/1,
          get_context_after_logging_init/1,
          is_dev_environment/0,
@@ -117,28 +119,172 @@ context_to_app_env_vars1(
 
 context_to_code_path(#{dev_environment := false,
                        plugins_path := PluginsPath}) ->
-    context_to_code_path1(PluginsPath);
+    Dirs = get_user_lib_dirs(PluginsPath),
+    add_paths_to_code_path(Dirs);
 context_to_code_path(#{dev_environment := true,
                        plugins_path := PluginsPath}) ->
-    context_to_code_path1(PluginsPath).
+    Dirs = get_user_lib_dirs(PluginsPath),
+    add_paths_to_code_path(Dirs).
 
-context_to_code_path1(Path) ->
+add_paths_to_code_path(Dirs) ->
+    Path = code:get_path(),
+    add_paths_to_code_path1(Path, lists:reverse(Dirs)).
+
+add_paths_to_code_path1(Path, [Dir | Rest]) ->
+    case lists:member(Dir, Path) of
+        true  -> ok;
+        false -> code:add_patha(Dir)
+    end,
+    add_paths_to_code_path1(Path, Rest);
+add_paths_to_code_path1(_, []) ->
+    ok.
+
+%% -------------------------------------------------------------------
+%% Code copied from `kernel/src/code_server.erl`.
+%%
+%% The goal is to mimic the behavior of the `$ERL_LIBS` environment
+%% variable.
+
+get_user_lib_dirs(Path) ->
     Sep = case os:type() of
               {win32, _} -> ";";
               _          -> ":"
           end,
     SplitPath = string:lexemes(Path, Sep),
-    context_to_code_path2(SplitPath).
+    get_user_lib_dirs_1(SplitPath).
 
-context_to_code_path2([Dir | Rest]) ->
+get_user_lib_dirs_1([Dir|DirList]) ->
     case erl_prim_loader:list_dir(Dir) of
-	{ok, SubDirs} ->
-            io:format(standard_error, "SubDirs = ~p~n", [SubDirs]);
-	error ->
-	    context_to_code_path2(Rest)
+        {ok, Dirs} ->
+            Paths = make_path(Dir, Dirs),
+            %% Only add paths trailing with ./ebin.
+            [P || P <- Paths, filename:basename(P) =:= "ebin"] ++
+                get_user_lib_dirs_1(DirList);
+        error ->
+            get_user_lib_dirs_1(DirList)
     end;
-context_to_code_path2([]) ->
-    ok.
+get_user_lib_dirs_1([]) -> [].
+
+%%
+%% Create the initial path.
+%%
+make_path(BundleDir, Bundles0) ->
+    Bundles = choose_bundles(Bundles0),
+    make_path(BundleDir, Bundles, []).
+
+choose_bundles(Bundles) ->
+    ArchiveExt = archive_extension(),
+    Bs = lists:sort([create_bundle(B, ArchiveExt) || B <- Bundles]),
+    [FullName || {_Name,_NumVsn,FullName} <-
+                     choose(lists:reverse(Bs), [], ArchiveExt)].
+
+create_bundle(FullName, ArchiveExt) ->
+    BaseName = filename:basename(FullName, ArchiveExt),
+    case split_base(BaseName) of
+        {Name, VsnStr} ->
+            case vsn_to_num(VsnStr) of
+                {ok, VsnNum} ->
+                    {Name,VsnNum,FullName};
+                false ->
+                    {FullName,[0],FullName}
+            end;
+        _ ->
+            {FullName,[0],FullName}
+    end.
+
+%% Convert "X.Y.Z. ..." to [K, L, M| ...]
+vsn_to_num(Vsn) ->
+    case is_vsn(Vsn) of
+        true ->
+            {ok, [list_to_integer(S) || S <- string:lexemes(Vsn, ".")]};
+        _  ->
+            false
+    end.
+
+is_vsn(Str) when is_list(Str) ->
+    Vsns = string:lexemes(Str, "."),
+    lists:all(fun is_numstr/1, Vsns).
+
+is_numstr(Cs) ->
+    lists:all(fun (C) when $0 =< C, C =< $9 -> true;
+                  (_)                       -> false
+              end, Cs).
+
+choose([{Name,NumVsn,NewFullName}=New|Bs], Acc, ArchiveExt) ->
+    case lists:keyfind(Name, 1, Acc) of
+        {_, NV, OldFullName} when NV =:= NumVsn ->
+            case filename:extension(OldFullName) =:= ArchiveExt of
+                false ->
+                    choose(Bs,Acc, ArchiveExt);
+                true ->
+                    Acc2 = lists:keystore(Name, 1, Acc, New),
+                    choose(Bs,Acc2, ArchiveExt)
+            end;
+        {_, _, _} ->
+            choose(Bs,Acc, ArchiveExt);
+        false ->
+            choose(Bs,[{Name,NumVsn,NewFullName}|Acc], ArchiveExt)
+    end;
+choose([],Acc, _ArchiveExt) ->
+    Acc.
+
+make_path(_, [], Res) ->
+    Res;
+make_path(BundleDir, [Bundle|Tail], Res) ->
+    Dir = filename:append(BundleDir, Bundle),
+    Ebin = filename:append(Dir, "ebin"),
+    %% First try with /ebin
+    case is_dir(Ebin) of
+        true ->
+            make_path(BundleDir, Tail, [Ebin|Res]);
+        false ->
+            %% Second try with archive
+            Ext = archive_extension(),
+            Base = filename:basename(Bundle, Ext),
+            Ebin2 = filename:join([BundleDir, Base ++ Ext, Base, "ebin"]),
+            Ebins =
+                case split_base(Base) of
+                    {AppName,_} ->
+                        Ebin3 = filename:join([BundleDir, Base ++ Ext,
+                                               AppName, "ebin"]),
+                        [Ebin3, Ebin2, Dir];
+                    _ ->
+                        [Ebin2, Dir]
+                end,
+            case try_ebin_dirs(Ebins) of
+                {ok,FoundEbin} ->
+                    make_path(BundleDir, Tail, [FoundEbin|Res]);
+                error ->
+                    make_path(BundleDir, Tail, Res)
+            end
+    end.
+
+try_ebin_dirs([Ebin|Ebins]) ->
+    case is_dir(Ebin) of
+        true -> {ok,Ebin};
+        false -> try_ebin_dirs(Ebins)
+    end;
+try_ebin_dirs([]) ->
+    error.
+
+split_base(BaseName) ->
+    case string:lexemes(BaseName, "-") of
+        [_, _|_] = Toks ->
+            Vsn = lists:last(Toks),
+            AllButLast = lists:droplast(Toks),
+            {string:join(AllButLast, "-"),Vsn};
+        [_|_] ->
+            BaseName
+    end.
+
+is_dir(Path) ->
+    case erl_prim_loader:read_file_info(Path) of
+        {ok,#file_info{type=directory}} -> true;
+        _ -> false
+    end.
+
+archive_extension() ->
+    init:archive_extension().
 
 %% -------------------------------------------------------------------
 %%
@@ -157,7 +303,7 @@ node_name_and_type(Context) ->
     NameType = get_node_name_type(),
     Nodename = get_node_name(NameType),
     Context#{nodename => Nodename,
-             split_nodename => rabbit_nodes:parts(Nodename),
+             split_nodename => rabbit_nodes_common:parts(Nodename),
              nodename_type => NameType}.
 
 get_node_name_type() ->
@@ -170,49 +316,52 @@ get_node_name_type() ->
 get_node_name(NameType) ->
     LongHostname = net_adm:localhost(),
     ShortHostname = re:replace(LongHostname, "\\..*$", "", [{return, list}]),
-    case os:getenv("RABBITMQ_NODENAME") of
-        false when NameType =:= shortnames ->
-            rabbit_nodes:make({"rabbit", ShortHostname});
-        false when NameType =:= longnames ->
-            rabbit_nodes:make({"rabbit", LongHostname});
-        Value ->
-            case string:find(Value, "@") of
-                nomatch when NameType =:= shortnames ->
-                    rabbit_nodes:make({Value, ShortHostname});
-                nomatch when NameType =:= longnames ->
-                    rabbit_nodes:make({Value, LongHostname});
-                _ ->
-                    rabbit_nodes:make(Value)
-            end
-    end.
+    Nodename = case os:getenv("RABBITMQ_NODENAME") of
+                   false when NameType =:= shortnames ->
+                       rabbit_nodes_common:make({"rabbit", ShortHostname});
+                   false when NameType =:= longnames ->
+                       rabbit_nodes_common:make({"rabbit", LongHostname});
+                   Value ->
+                       case string:find(Value, "@") of
+                           nomatch when NameType =:= shortnames ->
+                               rabbit_nodes_common:make(
+                                 {Value, ShortHostname});
+                           nomatch when NameType =:= longnames ->
+                               rabbit_nodes_common:make(
+                                 {Value, LongHostname});
+                           _ ->
+                               rabbit_nodes_common:make(
+                                 Value)
+                       end
+               end,
+    os:putenv("RABBITMQ_NODENAME", atom_to_list(Nodename)),
+    Nodename.
 
 %% -------------------------------------------------------------------
 %%
 %% RABBITMQ_CONFIG_FILE
-%%   Main configuration file
+%%   Main configuration file.
 %%   Extension is optional. `.config` for the old rlang-term-based
 %%   format, `.conf` for the new Cuttlefish-based format.
 %%   Default: (Unix) ${SYS_PREFIX}/etc/rabbitmq/rabbitmq
 %%         (Windows) ${RABBITMQ_BASE}\rabbitmq
 %%
 %% RABBITMQ_ADVANCED_CONFIG_FILE
-%%   Advanced configuration file
+%%   Advanced configuration file.
 %%   Erlang-term-based format with a `.config` extension.
 %%   Default: (Unix) ${SYS_PREFIX}/etc/rabbitmq/advanced.config
 %%         (Windows) ${RABBITMQ_BASE}\advanced.config
 %%
-%% TODO:
+%% Now unused:
 %%
-%% RABBITMQ_SCHEMA_DIR
-%%   Directory where all detected Cuttlefish schemas are written
-%%   Default: (Unix) ${SYS_PREFIX}/var/lib/rabbitmq/schema
-%%         (Windows) ${RABBITMQ_BASE}\schema
+%% RABBITMQ_SCHEMA_DIR [UNUSED]
+%%   Directory where all detected Cuttlefish schemas are written.
+%%   Replaced by the use of Cuttlefish as a libray.
 %%
-%% RABBITMQ_GENERATED_CONFIG_DIR
+%% RABBITMQ_GENERATED_CONFIG_DIR [UNUSED]
 %%   Directory where final configuration (generated from
 %%   Cuttlefish-based configuration) is written
-%%   Default: (Unix) ${SYS_PREFIX}/var/lib/rabbitmq/config
-%%         (Windows) ${RABBITMQ_BASE}\config
+%%   Replaced by the use of Cuttlefish as a libray.
 
 config_files(Context) ->
     ConfigBaseDir = get_config_base_dir(Context),
@@ -235,14 +384,18 @@ get_main_config_file_noex(ConfigBaseDir) ->
              "RABBITMQ_CONFIG_FILE",
              filename:join(ConfigBaseDir, "rabbitmq")),
     File1 = re:replace(File, "\\.(conf|config)$", "", [{return, list}]),
-    normalize_path(File1).
+    Normalized = normalize_path(File1),
+    os:putenv("RABBITMQ_CONFIG_FILE", Normalized),
+    Normalized.
 
 get_advanced_config_file_noex(ConfigBaseDir) ->
     File = get_prefixed_env_var(
              "RABBITMQ_ADVANCED_CONFIG_FILE",
              filename:join(ConfigBaseDir, "advanced")),
     File1 = re:replace(File, "\\.config$", "", [{return, list}]),
-    normalize_path(File1).
+    Normalized = normalize_path(File1),
+    os:putenv("RABBITMQ_ADVANCED_CONFIG_FILE", Normalized),
+    Normalized.
 
 %% -------------------------------------------------------------------
 %%
@@ -325,24 +478,35 @@ parse_level(_)           -> undefined.
 get_log_base_dir(#{os_type := {unix, _}}) ->
     SysPrefix = get_sys_prefix(),
     Default = filename:join([SysPrefix, "etc", "rabbitmq"]),
-    normalize_path(get_prefixed_env_var("RABBITMQ_LOG_BASE", Default));
+    Normalized = normalize_path(get_prefixed_env_var(
+                                  "RABBITMQ_LOG_BASE", Default)),
+    os:putenv("RABBITMQ_LOG_BASE", Normalized),
+    Normalized;
 get_log_base_dir(#{os_type := {win32, _}}) ->
     RabbitmqBase = get_rabbitmq_base(),
     Default = filename:join([RabbitmqBase, "log"]),
-    normalize_path(get_prefixed_env_var("RABBITMQ_LOG_BASE", Default)).
+    Normalized = normalize_path(get_prefixed_env_var(
+                                  "RABBITMQ_LOG_BASE", Default)),
+    os:putenv("RABBITMQ_LOG_BASE", Normalized),
+    Normalized.
 
 get_main_log_file(#{nodename := Nodename}, LogBaseDir) ->
     Default = filename:join(LogBaseDir, atom_to_list(Nodename) ++ ".log"),
     Value = get_prefixed_env_var("RABBITMQ_LOGS", Default),
-    case Value of
-        "-" -> Value;
-        _   -> normalize_path(Value)
-    end.
+    Normalized = case Value of
+                     "-" -> Value;
+                     _   -> normalize_path(Value)
+                 end,
+    os:putenv("RABBITMQ_LOGS", Normalized),
+    Normalized.
 
 get_upgrade_log_file(#{nodename := Nodename}, LogBaseDir) ->
     Default = filename:join(LogBaseDir,
                             atom_to_list(Nodename) ++ "_upgrade.log"),
-    normalize_path(get_prefixed_env_var("RABBITMQ_UPGRADE_LOG", Default)).
+    Normalized = normalize_path(get_prefixed_env_var(
+                                  "RABBITMQ_UPGRADE_LOG", Default)),
+    os:putenv("RABBITMQ_UPDATE_LOG", Normalized),
+    Normalized.
 
 %% -------------------------------------------------------------------
 %%
@@ -362,16 +526,30 @@ mnesia_dir(Context) ->
              mnesia_dir => MnesiaDir}.
 
 get_mnesia_base_dir(#{from_remote_node := false} = Context) ->
+    get_mnesia_base_dir_from_env(Context);
+get_mnesia_base_dir(#{from_remote_node := Remote} = Context) ->
+    case get_prefixed_env_var("RABBITMQ_MNESIA_BASE") of
+        false -> get_mnesia_base_dir_from_node(Context, Remote);
+        _     -> get_mnesia_base_dir_from_env(Context)
+    end.
+
+get_mnesia_base_dir_from_env(Context) ->
     Default = get_default_mnesia_base_dir(Context),
     Dir = get_prefixed_env_var("RABBITMQ_MNESIA_BASE", Default),
     Normalized = normalize_path(Dir),
     os:putenv("RABBITMQ_MNESIA_BASE", Normalized),
-    Normalized;
-get_mnesia_base_dir(#{from_remote_node := Remote}) ->
-    Dir = query_remote(Remote, os, getenv, ["RABBITMQ_MNESIA_BASE"]),
-    Normalized = normalize_path(Dir),
-    os:putenv("RABBITMQ_MNESIA_BASE", Normalized),
     Normalized.
+
+get_mnesia_base_dir_from_node(Context, Remote) ->
+    Ret = query_remote(Remote, os, getenv, ["RABBITMQ_MNESIA_BASE"]),
+    case Ret of
+        {ok, Dir} when Dir =/= false ->
+            Normalized = normalize_path(Dir),
+            os:putenv("RABBITMQ_MNESIA_BASE", Normalized),
+            Normalized;
+        {badrpc, nodedown} ->
+            get_mnesia_base_dir(Context)
+    end.
 
 get_default_mnesia_base_dir(Context) ->
     DataDir = get_rabbitmq_data_dir(Context),
@@ -381,23 +559,33 @@ get_default_mnesia_base_dir(Context) ->
                end,
     filename:join(DataDir, Basename).
 
-get_mnesia_dir(#{nodename := Nodename,
-                 from_remote_node := false}, MnesiaBaseDir) ->
+get_mnesia_dir(#{from_remote_node := false} = Context, MnesiaBaseDir) ->
+    get_mnesia_dir_from_env(Context, MnesiaBaseDir);
+get_mnesia_dir(#{from_remote_node := Remote} = Context, MnesiaBaseDir) ->
+    case get_prefixed_env_var("RABBITMQ_MNESIA_DIR") of
+        false -> get_mnesia_dir_from_node(Context, MnesiaBaseDir, Remote);
+        _     -> get_mnesia_dir_from_env(Context, MnesiaBaseDir)
+    end.
+
+get_mnesia_dir_from_env(#{nodename := Nodename}, MnesiaBaseDir) ->
     Dir = get_prefixed_env_var(
             "RABBITMQ_MNESA_DIR",
             filename:join(MnesiaBaseDir, Nodename)),
     Normalized = normalize_path(Dir),
     os:putenv("RABBITMQ_MNESIA_DIR", Normalized),
-    Normalized;
-get_mnesia_dir(#{from_remote_node := Remote}, _) ->
-    Dir = query_remote(Remote, application, get_env, [mnesia, dir]),
-    case Dir of
-        undefined ->
+    Normalized.
+
+get_mnesia_dir_from_node(Context, MnesiaBaseDir, Remote) ->
+    Ret = query_remote(Remote, application, get_env, [mnesia, dir]),
+    case Ret of
+        {ok, undefined} ->
             throw({query, Remote, {mnesia, dir, undefined}});
-        _ ->
+        {ok, {ok, Dir}} ->
             Normalized = normalize_path(Dir),
             os:putenv("RABBITMQ_MNESIA_DIR", Normalized),
-            Normalized
+            Normalized;
+        {badrpc, nodedown} ->
+            get_mnesia_dir_from_env(Context, MnesiaBaseDir)
     end.
 
 %% -------------------------------------------------------------------
@@ -432,7 +620,9 @@ get_pid_file_path(#{mnesia_base_dir := MnesiaBaseDir,
     File = get_prefixed_env_var(
              "RABBITMQ_PID_FILE",
              filename:join(MnesiaBaseDir, atom_to_list(Nodename) ++ ".pid")),
-    normalize_path(File).
+    Normalized = normalize_path(File),
+    os:putenv("RABBITMQ_PID_FILE", Normalized),
+    Normalized.
 
 %% -------------------------------------------------------------------
 %%
@@ -444,25 +634,35 @@ feature_flags_file(Context) ->
     FFFile = get_feature_flags_file(Context),
     Context#{feature_flags_file => FFFile}.
 
-get_feature_flags_file(#{mnesia_base_dir := MnesiaBaseDir,
-                         nodename := Nodename,
-                         from_remote_node := false}) ->
+get_feature_flags_file(#{from_remote_node := false} = Context) ->
+    get_feature_flags_file_from_env(Context);
+get_feature_flags_file(#{from_remote_node := Remote} = Context) ->
+    case get_prefixed_env_var("RABBITMQ_FEATURE_FLAGS_FILE") of
+        false -> get_feature_flags_file_from_node(Context, Remote);
+        _     -> get_feature_flags_file_from_env(Context)
+    end.
+
+get_feature_flags_file_from_env(#{mnesia_base_dir := MnesiaBaseDir,
+                                  nodename := Nodename}) ->
     Default = filename:join(MnesiaBaseDir,
                             atom_to_list(Nodename) ++ "-feature_flags"),
     File = get_env_var("RABBITMQ_FEATURE_FLAGS_FILE", Default),
     Normalized = normalize_path(File),
     os:putenv("RABBITMQ_FEATURE_FLAGS_FILE", Normalized),
-    Normalized;
-get_feature_flags_file(#{from_remote_node := Remote}) ->
-    File = query_remote(Remote,
+    Normalized.
+
+get_feature_flags_file_from_node(Context, Remote) ->
+    Ret = query_remote(Remote,
                         application, get_env, [rabbit, feature_flags_file]),
-    case File of
-        undefined ->
+    case Ret of
+        {ok, undefined} ->
             throw({query, Remote, {rabbit, feature_flags_file, undefined}});
-        _ ->
+        {ok, {ok, File}} ->
             Normalized = normalize_path(File),
             os:putenv("RABBITMQ_FEATURE_FLAGS_FILE", Normalized),
-            Normalized
+            Normalized;
+        {badrpc, nodedown} ->
+            get_feature_flags_file_from_env(Context)
     end.
 
 %% -------------------------------------------------------------------
@@ -488,18 +688,29 @@ plugins_dirs(Context) ->
              enabled_plugins_file => EnabledPluginsFile}.
 
 get_plugins_path(#{from_remote_node := false} = Context) ->
+    get_plugins_path_from_env(Context);
+get_plugins_path(#{from_remote_node := Remote} = Context) ->
+    case get_prefixed_env_var("RABBITMQ_PLUGINS_DIR") of
+        false -> get_plugins_path_from_node(Context, Remote);
+        _     -> get_plugins_path_from_env(Context)
+    end.
+
+get_plugins_path_from_env(Context) ->
     Path = get_prefixed_env_var(
              "RABBITMQ_PLUGINS_DIR", get_default_plugins_path(Context)),
     os:putenv("RABBITMQ_PLUGINS_DIR", Path),
-    Path;
-get_plugins_path(#{from_remote_node := Remote}) ->
-    Path = query_remote(Remote, application, get_env, [rabbit, plugins_dir]),
-    case Path of
-        undefined ->
+    Path.
+
+get_plugins_path_from_node(Context, Remote) ->
+    Ret = query_remote(Remote, application, get_env, [rabbit, plugins_dir]),
+    case Ret of
+        {ok, undefined} ->
             throw({query, Remote, {rabbit, plugins_dir, undefined}});
-        _ ->
+        {ok, {ok, Path}} ->
             os:putenv("RABBITMQ_PLUGINS_DIR", Path),
-            Path
+            Path;
+        {badrpc, nodedown} ->
+            get_plugins_path_from_env(Context)
     end.
 
 get_default_plugins_path(#{dev_environment := false}) ->
@@ -520,21 +731,32 @@ get_plugins_expand_dir(#{mnesia_base_dir := MnesiaBaseDir,
     Normalized.
 
 get_enabled_plugins_file(#{from_remote_node := false} = Context) ->
+    get_enabled_plugins_file_from_env(Context);
+get_enabled_plugins_file(#{from_remote_node := Remote} = Context) ->
+    case get_prefixed_env_var("RABBITMQ_ENABLED_PLUGINS_FILE") of
+        false -> get_enabled_plugins_file_from_node(Context, Remote);
+        _     -> get_enabled_plugins_file_from_env(Context)
+    end.
+
+get_enabled_plugins_file_from_env(Context) ->
     ConfigBaseDir = get_config_base_dir(Context),
     Default = filename:join(ConfigBaseDir, "enabled_plugins"),
     File = get_prefixed_env_var("RABBITMQ_ENABLED_PLUGINS_FILE", Default),
     Normalized = normalize_path(File),
     os:putenv("RABBITMQ_ENABLED_PLUGINS_FILE", Normalized),
-    Normalized;
-get_enabled_plugins_file(#{from_remote_node := Remote}) ->
-    File = query_remote(Remote,
-                        application, get_env, [rabbit, enabled_plugins_file]),
-    case File of
-        undefined ->
+    Normalized.
+
+get_enabled_plugins_file_from_node(Context, Remote) ->
+    Ret = query_remote(Remote,
+                       application, get_env, [rabbit, enabled_plugins_file]),
+    case Ret of
+        {ok, undefined} ->
             throw({query, Remote, {rabbit, enabled_plugins_file, undefined}});
-        _ ->
+        {ok, {ok, File}} ->
             os:putenv("RABBITMQ_ENABLED_PLUGINS_FILE", File),
-            File
+            File;
+        {badrpc, nodedown} ->
+            get_enabled_plugins_file_from_env(Context)
     end.
 
 %% -------------------------------------------------------------------
@@ -657,17 +879,22 @@ normalize_path(Path) ->
     filename:join(filename:split(Path)).
 
 is_dev_environment() ->
-    LibDir = code:lib_dir(rabbit_common),
-    ErlangMkLoc1 = filename:join(
-                     filename:dirname(filename:dirname(LibDir)),
-                     "erlang.mk"),
-    ErlangMkLoc2 = filename:join(LibDir, "erlang.mk"),
+    %LibDir = code:lib_dir(rabbit_common),
+    {_, _, File} = code:get_object_code(?MODULE),
+    LibDir = filename:dirname(filename:dirname(File)),
+    %% Module can be:
+    %%     1. rabbit_common/ebin/rabbit_env.beam.
+    %%        LibDir = rabbit_common
+    %%     2. rabbit/escript/$cli/rabbit_env.beam.
+    %%        LibDir = rabbit/escript
+    ErlangMkLoc1 = filename:join(LibDir, "erlang.mk"),
+    ErlangMkLoc2 = filename:join(filename:dirname(LibDir), "erlang.mk"),
     filelib:is_regular(ErlangMkLoc1) orelse filelib:is_regular(ErlangMkLoc2).
 
 maybe_setup_dist_for_remote_query(#{from_remote_node := false} = Context) ->
     Context;
 maybe_setup_dist_for_remote_query(#{from_remote_node := Remote} = Context) ->
-    {NamePart, HostPart} = rabbit_nodes:parts(Remote),
+    {NamePart, HostPart} = rabbit_nodes_common:parts(Remote),
     NameType = case string:find(HostPart, ".") of
                    nomatch -> shortnames;
                    _       -> longnames
@@ -680,7 +907,7 @@ setup_dist_for_remote_query(Context,
                             NamePart, HostPart, NameType,
                             Attempts) ->
     RndNamePart = NamePart ++ "_ctl_" ++ integer_to_list(rand:uniform(100)),
-    Nodename = rabbit_nodes:make({RndNamePart, HostPart}),
+    Nodename = rabbit_nodes_common:make({RndNamePart, HostPart}),
     case net_kernel:start([Nodename, NameType]) of
         {ok, _} -> Context;
         _       -> setup_dist_for_remote_query(Context,
@@ -697,6 +924,7 @@ maybe_stop_dist_for_remote_query(Context) ->
 query_remote(Remote, Mod, Func, Args) ->
     Ret = rpc:call(Remote, Mod, Func, Args, ?RPC_TIMEOUT),
     case Ret of
-        {badrpc, _} = Error -> throw({query, Remote, Error});
-        _                   -> Ret
+        {badrpc, nodedown} = Error -> Error;
+        {badrpc, _} = Error        -> throw({query, Remote, Error});
+        _                          -> {ok, Ret}
     end.
